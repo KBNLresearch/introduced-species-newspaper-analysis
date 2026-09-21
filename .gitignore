@@ -1,0 +1,6 @@
+# Local Delpher documentation snapshot
+# Ignore downloaded API docs and any files under the directory.
+delpher-docs/
+
+# Local data files and extracted artifacts
+data/
