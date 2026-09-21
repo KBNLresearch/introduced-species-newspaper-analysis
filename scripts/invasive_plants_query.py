@@ -7,8 +7,11 @@ import re
 import time
 import requests
 import xml.etree.ElementTree as ET
-from urllib.parse import urlencode
 
+# tackle wildcards with https://www.delpher.nl/nl/api/lexicon?wordform=inheems,inlands,plant,struik,buitenlands
+# fuzzy search https://jsru.kb.nl/sru/sru?operation=searchRetrieve&version=1.2&maximumRecords=10&x-collection=DDD_artikel&recordSchema=ddd&query=content%20=/fuzzy%20%22inheemsche%22
+
+# PROX query: (allochtoon OR exoot OR exotisch OR invasief OR invasiev OR onkruid OR ruderaal OR uitheems) PROX (plant OR bloem)
 QUERY = ("(allochtoon* OR exoot* OR exotisch* OR invasief* OR invasiev* "
          "OR ruderaal OR uitheems*) AND (plant* OR bloem*)")
 # OR onkruid*
@@ -20,7 +23,7 @@ QUERY_WITH_DATES = QUERY + ' AND date within "01-01-1800 31-12-1999"'
 # illustratie met onderschrift 345, familiebericht 52.
 TYPES = ["artikel", "advertentie", "familiebericht", "illustratie met onderschrift"]
 
-MAX_RECORDS = 10
+PAGE_SIZE = 100
 OUT_DIR = "data/invasive_plants_query"
 MANIFEST = os.path.join(OUT_DIR, "records.csv")
 HEADERS = {"User-Agent": "DelpherBot/1.0 (research)"}
@@ -35,22 +38,15 @@ query = QUERY_WITH_DATES
 if TYPES:
     query += " AND (" + " OR ".join(f'type="{t}"' for t in TYPES) + ")"
 
-url = "https://jsru.kb.nl/sru/sru?" + urlencode({
+SRU_URL = "https://jsru.kb.nl/sru/sru"
+REQUEST_PARAMS = {
     "version": "1.2",
     "operation": "searchRetrieve",
     "query": query,
-    "startRecord": "1",
-    "maximumRecords": str(MAX_RECORDS),
+    "maximumRecords": str(PAGE_SIZE),
     "recordSchema": "ddd",
     "x-collection": "DDD_artikel",
-})
-
-# print(url)
-xml = requests.get(url, headers=HEADERS, timeout=60).text
-
-hits = re.search(r"numberOfRecords>(\d+)<", xml)
-print(f"hits: {hits.group(1) if hits else '?'}")
-# print(xml)
+}
 
 
 def parse_metadata(record_data):
@@ -87,37 +83,68 @@ def extract_text(content):
 
 
 os.makedirs(OUT_DIR, exist_ok=True)
-root = ET.fromstring(xml.encode("utf-8"))
 rows = []
-
-for rec in root.findall(".//{http://www.loc.gov/zing/srw/}recordData"):
-    meta = parse_metadata(rec)
-    mkey = meta.get("metadataKey")
-    if not mkey:
-        continue
-    filepath = os.path.join(OUT_DIR, mkey.replace(":", "_") + ".txt")
-    ocr_url = f"https://resolver.kb.nl/resolve?urn={mkey}:ocr"
-    if os.path.exists(filepath):
-        print(f"  have {filepath}")
-    else:
-        r = requests.get(ocr_url, headers=HEADERS, timeout=60)
-        if r.status_code == 200:
-            with open(filepath, "w", encoding="utf-8") as out:
-                out.write(extract_text(r.content))
-            print(f"  saved {filepath}")
-        else:
-            print(f"  failed {mkey} (status {r.status_code})")
-            filepath = ""
-        time.sleep(0.25)
-    row = {k: meta.get(k, "") for k in FIELDS}
-    row["filepath"] = filepath
-    row["ocr_url"] = ocr_url
-    row["viewer_url"] = f"https://www.delpher.nl/nl/kranten/view?identifier={mkey}"
-    rows.append(row)
+start_record = 1
+total_records = None
+processed_records = 0
 
 with open(MANIFEST, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=FIELDS + ["filepath", "ocr_url", "viewer_url"])
     w.writeheader()
-    w.writerows(rows)
 
-print(f"manifest: {MANIFEST} ({len(rows)} rows)")
+    while total_records is None or start_record <= total_records:
+        params = {**REQUEST_PARAMS, "startRecord": str(start_record)}
+        response = requests.get(SRU_URL, params=params, headers=HEADERS, timeout=60)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        if total_records is None:
+            total_records = int(root.findtext(
+                ".//{http://www.loc.gov/zing/srw/}numberOfRecords", "0"))
+            print(f"hits: {total_records}")
+
+        records = root.findall(".//{http://www.loc.gov/zing/srw/}recordData")
+        if not records:
+            break
+        print(f"records {start_record}-{start_record + len(records) - 1} of {total_records}")
+
+        for rec in records:
+            processed_records += 1
+            meta = parse_metadata(rec)
+            mkey = meta.get("metadataKey")
+            if not mkey:
+                print(f"progress: {processed_records}/{total_records}")
+                continue
+            filepath = os.path.join(OUT_DIR, mkey.replace(":", "_") + ".txt")
+            ocr_url = f"https://resolver.kb.nl/resolve?urn={mkey}:ocr"
+            temporary_path = filepath + ".part"
+            if os.path.isfile(filepath) and os.path.getsize(filepath) > 0:
+                print(f"  have {filepath}")
+            else:
+                try:
+                    r = requests.get(ocr_url, headers=HEADERS, timeout=60)
+                    r.raise_for_status()
+                    text = extract_text(r.content)
+                    if not text.strip():
+                        raise ValueError("empty OCR response")
+                    with open(temporary_path, "w", encoding="utf-8") as out:
+                        out.write(text)
+                    os.replace(temporary_path, filepath)
+                    print(f"  saved {filepath}")
+                except (requests.RequestException, ValueError) as error:
+                    print(f"  failed {mkey}: {error}")
+                    filepath = ""
+                    if os.path.exists(temporary_path):
+                        os.remove(temporary_path)
+                time.sleep(0.25)
+            row = {k: meta.get(k, "") for k in FIELDS}
+            row["filepath"] = filepath
+            row["ocr_url"] = ocr_url
+            row["viewer_url"] = f"https://www.delpher.nl/nl/kranten/view?identifier={mkey}"
+            w.writerow(row)
+            print(f"progress: {processed_records}/{total_records}")
+
+        f.flush()
+        start_record += len(records)
+
+print(f"manifest: {MANIFEST}")
